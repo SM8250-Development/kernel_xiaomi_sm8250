@@ -183,7 +183,8 @@ static void cam_isp_ctx_dump_req(struct cam_isp_ctx_req *req_isp)
 				CAM_ERR(CAM_ISP,
 					"Invalid offset exp %u actual %u",
 					req_isp->cfg[i].offset, (uint32_t)len);
-				return;
+				cam_mem_put_cpu_buf(req_isp->cfg[i].handle);
+				return -EINVAL;
 			}
 			remain_len = len - req_isp->cfg[i].offset;
 
@@ -193,14 +194,31 @@ static void cam_isp_ctx_dump_req(struct cam_isp_ctx_req *req_isp)
 					"Invalid len exp %u remain_len %u",
 					req_isp->cfg[i].len,
 					(uint32_t)remain_len);
-				return;
+				cam_mem_put_cpu_buf(req_isp->cfg[i].handle);
+				return -EINVAL;
 			}
 
 			buf_start = (uint32_t *)((uint8_t *) buf_addr +
 				req_isp->cfg[i].offset);
 			buf_end = (uint32_t *)((uint8_t *) buf_start +
 				req_isp->cfg[i].len - 1);
-			cam_cdm_util_dump_cmd_buf(buf_start, buf_end);
+			if (dump_to_buff) {
+				if (!cpu_addr || !offset || !buf_len) {
+					CAM_ERR(CAM_ISP, "Invalid args");
+					break;
+				}
+				dump_info.src_start = buf_start;
+				dump_info.src_end =   buf_end;
+				dump_info.dst_start = cpu_addr;
+				dump_info.dst_offset = *offset;
+				dump_info.dst_max_size = buf_len;
+				rc = cam_cdm_util_dump_cmd_bufs_v2(&dump_info);
+				*offset = dump_info.dst_offset;
+				if (rc)
+					return rc;
+			} else {
+				cam_cdm_util_dump_cmd_buf(buf_start, buf_end);
+			}
 		}
 	}
 }
@@ -2836,6 +2854,204 @@ static int __cam_isp_ctx_apply_req_in_bubble(
 	return rc;
 }
 
+static int __cam_isp_ctx_dump_req_info(
+	struct cam_context     *ctx,
+	struct cam_ctx_request *req,
+	uintptr_t               cpu_addr,
+	size_t                  buf_len,
+	size_t                 *offset)
+{
+	int                                 i, rc;
+	uint8_t                            *dst;
+	int32_t                            *addr, *start;
+	uint32_t                            min_len;
+	size_t                              remain_len;
+	struct cam_isp_ctx_req             *req_isp;
+	struct cam_isp_context             *ctx_isp;
+	struct cam_isp_context_dump_header *hdr;
+
+	if (!req || !ctx || !offset || !cpu_addr || !buf_len) {
+		CAM_ERR(CAM_ISP, "Invalid parameters %pK %pK %pK %zu",
+			req, ctx, offset, buf_len);
+		return -EINVAL;
+	}
+	req_isp = (struct cam_isp_ctx_req *)req->req_priv;
+	ctx_isp = (struct cam_isp_context *)ctx->ctx_priv;
+
+	if (buf_len <= *offset) {
+		CAM_WARN(CAM_ISP, "Dump buffer overshoot len %zu offset %zu",
+			buf_len, *offset);
+		return -ENOSPC;
+	}
+
+	remain_len = buf_len - *offset;
+	min_len = sizeof(struct cam_isp_context_dump_header) +
+		(CAM_ISP_CTX_DUMP_REQUEST_NUM_WORDS *
+		 req_isp->num_fence_map_out *
+		sizeof(int32_t));
+
+	if (remain_len < min_len) {
+		CAM_WARN(CAM_ISP, "Dump buffer exhaust remain %zu min %u",
+			remain_len, min_len);
+		return -ENOSPC;
+	}
+
+	dst = (uint8_t *)cpu_addr + *offset;
+	hdr = (struct cam_isp_context_dump_header *)dst;
+	hdr->word_size = sizeof(int32_t);
+	scnprintf(hdr->tag, CAM_ISP_CONTEXT_DUMP_TAG_MAX_LEN,
+		"ISP_OUT_FENCE:");
+	addr = (int32_t *)(dst + sizeof(struct cam_isp_context_dump_header));
+	start = addr;
+	for (i = 0; i < req_isp->num_fence_map_out; i++) {
+		*addr++ = req_isp->fence_map_out[i].resource_handle;
+		*addr++ = req_isp->fence_map_out[i].sync_id;
+	}
+	hdr->size = hdr->word_size * (addr - start);
+	*offset += hdr->size + sizeof(struct cam_isp_context_dump_header);
+	rc = cam_isp_ctx_dump_req(req_isp, cpu_addr, buf_len,
+		offset, true);
+	return rc;
+}
+
+static int __cam_isp_ctx_dump_in_top_state(
+	struct cam_context           *ctx,
+	struct cam_req_mgr_dump_info *dump_info)
+{
+	int                                 rc = 0;
+	bool                                dump_only_event_record = false;
+	size_t                              buf_len;
+	size_t                              remain_len;
+	uint8_t                            *dst;
+	ktime_t                             cur_time;
+	uint32_t                            min_len;
+	uint64_t                            diff;
+	uint64_t                           *addr, *start;
+	uintptr_t                           cpu_addr;
+	struct timespec64                   ts;
+	struct cam_isp_context             *ctx_isp;
+	struct cam_ctx_request             *req = NULL;
+	struct cam_isp_ctx_req             *req_isp;
+	struct cam_ctx_request             *req_temp;
+	struct cam_hw_dump_args             dump_args;
+	struct cam_isp_context_dump_header *hdr;
+
+	spin_lock_bh(&ctx->lock);
+	list_for_each_entry_safe(req, req_temp,
+		&ctx->active_req_list, list) {
+		if (req->request_id == dump_info->req_id) {
+			CAM_INFO(CAM_ISP, "isp dump active list req: %lld",
+			    dump_info->req_id);
+			goto hw_dump;
+		}
+	}
+	list_for_each_entry_safe(req, req_temp,
+		&ctx->wait_req_list, list) {
+		if (req->request_id == dump_info->req_id) {
+			CAM_INFO(CAM_ISP, "isp dump wait list req: %lld",
+			    dump_info->req_id);
+			goto hw_dump;
+		}
+	}
+	spin_unlock_bh(&ctx->lock);
+	return rc;
+hw_dump:
+	rc  = cam_mem_get_cpu_buf(dump_info->buf_handle,
+		&cpu_addr, &buf_len);
+	if (rc) {
+		CAM_ERR(CAM_ISP, "Invalid handle %u rc %d",
+			dump_info->buf_handle, rc);
+		spin_unlock_bh(&ctx->lock);
+		return rc;
+	}
+	if (buf_len <= dump_info->offset) {
+		spin_unlock_bh(&ctx->lock);
+		CAM_WARN(CAM_ISP, "Dump buffer overshoot len %zu offset %zu",
+			buf_len, dump_info->offset);
+		cam_mem_put_cpu_buf(dump_info->buf_handle);
+		return -ENOSPC;
+	}
+
+	remain_len = buf_len - dump_info->offset;
+	min_len = sizeof(struct cam_isp_context_dump_header) +
+		(CAM_ISP_CTX_DUMP_NUM_WORDS * sizeof(uint64_t));
+
+	if (remain_len < min_len) {
+		spin_unlock_bh(&ctx->lock);
+		CAM_WARN(CAM_ISP, "Dump buffer exhaust remain %zu min %u",
+			remain_len, min_len);
+		cam_mem_put_cpu_buf(dump_info->buf_handle);
+		return -ENOSPC;
+	}
+
+	ctx_isp = (struct cam_isp_context *) ctx->ctx_priv;
+	req_isp = (struct cam_isp_ctx_req *) req->req_priv;
+	cur_time = ktime_get();
+	diff = ktime_us_delta(cur_time,
+		req_isp->event_timestamp[CAM_ISP_CTX_EVENT_APPLY]);
+	if (diff < CAM_ISP_CTX_RESPONSE_TIME_THRESHOLD) {
+		CAM_INFO(CAM_ISP, "req %lld found no error",
+			req->request_id);
+		dump_only_event_record = true;
+	}
+	dst = (uint8_t *)cpu_addr + dump_info->offset;
+	hdr = (struct cam_isp_context_dump_header *)dst;
+	scnprintf(hdr->tag, CAM_ISP_CONTEXT_DUMP_TAG_MAX_LEN,
+		"ISP_CTX_DUMP:");
+	hdr->word_size = sizeof(uint64_t);
+	addr = (uint64_t *)(dst +
+		sizeof(struct cam_isp_context_dump_header));
+	start = addr;
+	*addr++ = req->request_id;
+	ts      = ktime_to_timespec64(
+		req_isp->event_timestamp[CAM_ISP_CTX_EVENT_APPLY]);
+	*addr++ = ts.tv_sec;
+	*addr++ = ts.tv_nsec/NSEC_PER_USEC;
+	ts      = ktime_to_timespec64(cur_time);
+	*addr++ = ts.tv_sec;
+	*addr++ = ts.tv_nsec/NSEC_PER_USEC;
+	hdr->size = hdr->word_size * (addr - start);
+	dump_info->offset += hdr->size +
+		sizeof(struct cam_isp_context_dump_header);
+
+	rc = __cam_isp_ctx_dump_event_record(ctx_isp, cpu_addr,
+		buf_len, &dump_info->offset);
+	if (rc) {
+		CAM_ERR(CAM_ISP, "Dump event fail %lld",
+			req->request_id);
+		goto end;
+	}
+	if (dump_only_event_record)
+		goto end;
+
+	rc = __cam_isp_ctx_dump_req_info(ctx, req, cpu_addr,
+		buf_len, &dump_info->offset);
+	if (rc) {
+		CAM_ERR(CAM_ISP, "Dump Req info fail %lld",
+			req->request_id);
+		goto end;
+	}
+	spin_unlock_bh(&ctx->lock);
+
+	if (ctx->hw_mgr_intf->hw_dump) {
+		dump_args.offset = dump_info->offset;
+		dump_args.request_id = dump_info->req_id;
+		dump_args.buf_handle = dump_info->buf_handle;
+		dump_args.ctxt_to_hw_map = ctx_isp->hw_ctx;
+		rc = ctx->hw_mgr_intf->hw_dump(
+			ctx->hw_mgr_intf->hw_mgr_priv,
+			&dump_args);
+		dump_info->offset = dump_args.offset;
+	}
+	cam_mem_put_cpu_buf(dump_info->buf_handle);
+	return rc;
+
+end:
+	spin_unlock_bh(&ctx->lock);
+	cam_mem_put_cpu_buf(dump_info->buf_handle);
+	return rc;
+}
+
 static int __cam_isp_ctx_flush_req(struct cam_context *ctx,
 	struct list_head *req_list, struct cam_req_mgr_flush_request *flush_req)
 {
@@ -4025,6 +4241,11 @@ static int __cam_isp_ctx_config_dev_in_top_state(
 		"Preprocessing Config req_id %lld successful on ctx %u",
 		req->request_id, ctx->ctx_id);
 
+	if (ctx_isp->offline_context && atomic_read(&ctx_isp->rxd_epoch)) {
+		__cam_isp_ctx_schedule_apply_req_offline(ctx_isp);
+	}
+
+	cam_mem_put_cpu_buf((int32_t) cmd->packet_handle);
 	return rc;
 
 put_ref:
@@ -4038,6 +4259,7 @@ free_req:
 	list_add_tail(&req->list, &ctx->free_req_list);
 	spin_unlock_bh(&ctx->lock);
 
+	cam_mem_put_cpu_buf((int32_t) cmd->packet_handle);
 	return rc;
 }
 
